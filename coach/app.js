@@ -291,7 +291,7 @@ for (const id of ['email', 'password']) {
   $('#' + id).addEventListener('focus', () => clearFieldError(id));
   $('#' + id).addEventListener('input', () => clearFieldError(id));
 }
-for (const [id, provider] of [['google-sign-in', 'google'], ['apple-sign-in', 'apple']]) {
+for (const [id, provider] of [['google-sign-in', 'google']]) {
   $('#' + id).addEventListener('click', () => {
     sessionStorage.setItem(OAUTH_KEY, String(Date.now()));
     sessionStorage.setItem('trainable_web_oauth_intent', String(Date.now()));
