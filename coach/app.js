@@ -6,12 +6,15 @@ const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const ORDER = [1, 2, 3, 4, 5, 6, 0];
 const ZONES = [['recovery', 'Z1 · Recovery'], ['endurance', 'Z2 · Endurance'], ['tempo', 'Z3 · Tempo'], ['sweet_spot', 'Sweet spot'], ['threshold', 'Z4 · Threshold'], ['vo2max', 'Z5 · VO₂max'], ['anaerobic', 'Z6 · Anaerobic'], ['open', 'Open effort']];
 const TYPES = [['warmup', 'Warm-up'], ['work', 'Work'], ['recovery', 'Recovery'], ['cooldown', 'Cool-down']];
-const state = { roster: [], athleteId: null, athlete: null, builder: null, meeting: null, sharedWith: [], trigger: null, editorDirty: false };
+const state = { roster: [], athleteId: null, athlete: null, builder: null, meeting: null, weekDraft: null, weekSelection: null,
+  sharedWith: [], trigger: null, editorDirty: false, noteToArchive: null,
+  weekGenerating: false, weekPublishing: false, noteSaving: false };
 const $ = (selector) => document.querySelector(selector);
 const safe = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
 const title = (value) => String(value ?? '').replace(/_/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase());
 const dateLabel = (iso) => iso ? new Date(iso.includes('T') ? iso : iso + 'T12:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '';
 const minutesLabel = (n) => n ? (n >= 60 ? Math.floor(n / 60) + 'h ' + (n % 60 ? (n % 60) + 'm' : '') : n + 'm') : 'Rest';
+const trainingMinutesLabel = (n) => n ? minutesLabel(n) : '0m';
 const localDate = () => { const d = new Date(); return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0')].join('-'); };
 const currentWeek = () => { const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0')].join('-'); };
 
@@ -80,10 +83,12 @@ async function loadWorkspace() {
   showWorkspace(result.email || session()?.user?.email);
   renderRoster();
   const route = location.hash.slice(1).split('/');
-  const wanted = ['athlete', 'builder', 'meeting'].includes(route[0]) ? route[1] : null;
+  const wanted = ['athlete', 'builder', 'meeting', 'week', 'note'].includes(route[0]) ? route[1] : null;
   await selectAthlete(state.roster.some((p) => p.id === wanted) ? wanted : state.athleteId && state.roster.some((p) => p.id === state.athleteId) ? state.athleteId : state.roster[0]?.id);
   if (route[0] === 'builder' && wanted === state.athleteId) openBuilder();
   if (route[0] === 'meeting' && wanted === state.athleteId) openMeeting();
+  if (route[0] === 'week' && wanted === state.athleteId) openWeek();
+  if (route[0] === 'note' && wanted === state.athleteId) openNote();
 }
 function renderRoster() {
   $('#roster-count').textContent = String(state.roster.length);
@@ -120,7 +125,10 @@ function renderAthlete() {
   }).join('');
   const meetingRows = data.meetings.length ? data.meetings.map((m, mi) => `<div class="meeting-row"><strong>${safe(dateLabel(m.happened_at))} · Coach call</strong><p>${safe(m.summary)}</p>${m.meeting_url ? '<small>Google Meet linked</small>' : ''}<div class="meeting-changes">${(m.proposed_changes || []).map((c, ci) => `<button type="button" data-change="${mi}:${ci}">Draft workout from: ${safe(c)}</button>`).join('')}</div></div>`).join('') : '<div class="list-empty"><strong>No coach calls yet</strong><p>Review a Google Meet transcript to turn agreed changes into a clear plan.</p><button type="button" class="secondary small-button" data-action="new-meeting">Add call notes</button></div>';
   const activityRows = data.activities.length ? data.activities.slice(0, 4).map((a) => `<div class="activity-row"><strong>${safe(title(a.sport_type))} · ${safe(minutesLabel(Math.round(a.duration_s / 60)))}</strong><br><small>${safe(dateLabel(a.start_date))}${a.raw_tss ? ' · ' + Math.round(a.raw_tss) + ' TSS' : ''}</small></div>`).join('') : '<div class="list-empty">Recent activities will appear after a training source syncs.</div>';
-  $('#athlete-pane').innerHTML = `<div class="athlete-top"><div><p class="eyebrow">${isSelf ? 'YOUR ATHLETE PROFILE' : 'SHARED ATHLETE'}</p><h2>${safe(name)}</h2><p>${safe(title(p.primary_sport || 'Training'))} · Week of ${safe(dateLabel(week))}</p></div><div class="athlete-actions"><button type="button" class="secondary small-button" data-action="review-week">Ask assistant to review</button><button type="button" class="secondary small-button" data-action="new-meeting">Add call notes</button><button type="button" class="primary small-button" data-action="new-workout">Create workout</button></div></div><div class="metrics">${cells.map((c) => `<div class="metric"><span>${safe(c[0])}</span><strong>${safe(c[1])}</strong><small>${safe(c[2])}</small></div>`).join('')}</div><div class="section-head"><h3>This week</h3><small>${safe(dateLabel(week))}–${safe(dateLabel(new Date(new Date(week + 'T12:00:00Z').getTime() + 6 * 86400000).toISOString()))}</small></div><div class="week-list">${weekRows}</div><p class="foot-note">Coach prescriptions are protected when Trainable replans open days. A saved workout also appears in the athlete app.</p><div class="two-column"><section><div class="section-head"><h3>Recent training</h3></div><div class="activity-list">${activityRows}</div></section><section><div class="section-head"><h3>Coach calls</h3></div><div class="meeting-list">${meetingRows}</div></section></div>`;
+  const noteKinds = { observation: 'Training response', preference: 'Preference', goal: 'Goal', constraint: 'Constraint' };
+  const noteRows = data.coach_notes?.length ? data.coach_notes.map((n) => `<div class="note-row"><div><small>${safe(noteKinds[n.kind] || 'Note')} · ${n.author_id === state.athleteId ? 'Athlete' : 'Coach'} · ${safe(dateLabel(n.created_at))}</small><p>${safe(n.body)}</p></div>${isSelf || n.author_id === session()?.user?.id ? `<button type="button" class="quiet small-button" data-archive-note="${safe(n.id)}">Archive</button>` : ''}</div>`).join('') : '<div class="list-empty"><strong>No athlete notes yet</strong><p>Add a training response, goal or preference so the assistant can consider it when drafting.</p><button type="button" class="secondary small-button" data-action="new-note">Add athlete note</button></div>';
+  $('#athlete-pane').innerHTML = `<div class="athlete-top"><div><p class="eyebrow">${isSelf ? 'YOUR ATHLETE PROFILE' : 'SHARED ATHLETE'}</p><h2>${safe(name)}</h2><p>${safe(title(p.primary_sport || 'Training'))} · Week of ${safe(dateLabel(week))}</p></div><div class="athlete-actions"><button type="button" class="secondary small-button" data-action="new-note">Add athlete note</button><button type="button" class="secondary small-button" data-action="new-meeting">Add call notes</button><button type="button" class="secondary small-button" data-action="new-workout">Create workout</button><button type="button" class="primary small-button" data-action="build-week">Build full week</button></div></div><div class="metrics">${cells.map((c) => `<div class="metric"><span>${safe(c[0])}</span><strong>${safe(c[1])}</strong><small>${safe(c[2])}</small></div>`).join('')}</div><div class="section-head"><h3>This week</h3><small>${safe(dateLabel(week))}–${safe(dateLabel(new Date(new Date(week + 'T12:00:00Z').getTime() + 6 * 86400000).toISOString()))}</small></div><div class="week-list">${weekRows}</div><p class="foot-note">Coach prescriptions are protected when Trainable replans open days. A saved workout also appears in the athlete app.</p><div class="two-column"><section><div class="section-head"><h3>Recent training</h3></div><div class="activity-list">${activityRows}</div></section><section><div class="section-head"><h3>Coach calls</h3></div><div class="meeting-list">${meetingRows}</div></section></div><section class="profile-notes"><div class="section-head"><h3>Athlete notes</h3>${data.coach_notes?.length ? '<button type="button" class="quiet small-button" data-action="new-note">Add note</button>' : ''}</div><p class="helper">Shared with this athlete and their connected coach. The assistant uses these only when relevant and AI sharing is allowed.</p><div class="meeting-list">${noteRows}</div></section>`;
+  $('#athlete-pane .athlete-actions').insertAdjacentHTML('afterbegin', '<button type="button" class="secondary small-button" data-action="review-week">Review one day</button>');
 }
 function openDrawer(kicker, titleText, markup) {
   state.trigger = document.activeElement;
@@ -144,7 +152,7 @@ function closeDrawer(force = false) {
   $('#drawer').hidden = true; $('#drawer-backdrop').hidden = true; document.body.style.overflow = '';
   $('#drawer').classList.remove('page-mode');
   if (wasPage) { $('#workspace').hidden = false; history.replaceState(null, '', '#athlete/' + state.athleteId); }
-  state.builder = null; state.meeting = null; state.editorDirty = false;
+  state.builder = null; state.meeting = null; state.weekDraft = null; state.editorDirty = false;
   if (state.trigger?.isConnected) state.trigger.focus(); state.trigger = null;
 }
 function optionMarkup(options, selected) { return options.map(([value, label]) => `<option value="${safe(value)}" ${value === selected ? 'selected' : ''}>${safe(label)}</option>`).join(''); }
@@ -210,6 +218,131 @@ async function reviewWeek() {
     state.builder = { ...d, prompt: '', day_of_week: result.suggested_day_of_week };
     renderBuilder(); $('#draft-status').textContent = 'Assistant suggestion. Check the day and blocks before saving.';
     setStatus('');
+  } catch (error) { setStatus(error.message, true); }
+}
+function nextWeek() { const d = new Date(currentWeek() + 'T12:00:00'); d.setDate(d.getDate() + 7); return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0')].join('-'); }
+function weekMinutes(day) { return day.locked ? (day.existing || []).reduce((n, w) => n + (Number(w.target_duration_min) || 0), 0)
+  : day.rest ? 0 : (day.blocks || []).reduce((n, b) => n + (Number(b.duration_min) || 0), 0); }
+function weekBlocksMarkup(day) {
+  return (day.blocks || []).map((b, i) => `<div class="block-row" data-week-block="${i}"><div><label for="week-type-${day.day_of_week}-${i}">Block</label><select id="week-type-${day.day_of_week}-${i}" data-week-block-field="type">${optionMarkup(TYPES, b.type)}</select></div><div><label for="week-zone-${day.day_of_week}-${i}">Zone</label><select id="week-zone-${day.day_of_week}-${i}" data-week-block-field="zone">${optionMarkup(ZONES, b.zone)}</select></div><div><label for="week-duration-${day.day_of_week}-${i}">Minutes</label><input id="week-duration-${day.day_of_week}-${i}" data-week-block-field="duration_min" type="number" min="1" max="180" value="${safe(b.duration_min)}"></div><div class="move-controls"><button type="button" class="icon-button" data-week-move="${day.day_of_week}:${i}:-1" aria-label="Move block ${i + 1} up">↑</button><button type="button" class="icon-button" data-week-move="${day.day_of_week}:${i}:1" aria-label="Move block ${i + 1} down">↓</button><button type="button" class="icon-button" data-week-remove="${day.day_of_week}:${i}" aria-label="Remove block ${i + 1}">×</button></div></div>`).join('');
+}
+function weekDayMarkup(day) {
+  const label = DAYS[day.day_of_week];
+  if (day.locked) return `<article class="week-edit-day locked"><div class="week-edit-heading"><strong>${label}</strong><span>Preserved · ${safe(minutesLabel(weekMinutes(day)))}</span></div><p>${safe((day.existing || []).map((w) => w.headline || title(w.workout_type)).join(' + ') || 'Past day')}</p><small>Completed sessions, races and existing coach sessions stay in place.</small></article>`;
+  return `<article class="week-edit-day" data-week-day="${day.day_of_week}"><div class="week-edit-heading"><strong>${label}</strong><span>${safe(minutesLabel(weekMinutes(day)))}</span></div><div class="week-day-choice"><label for="week-mode-${day.day_of_week}">Plan for ${label}</label><select id="week-mode-${day.day_of_week}" data-week-field="mode"><option value="ride" ${day.rest ? '' : 'selected'}>Workout</option><option value="rest" ${day.rest ? 'selected' : ''}>Rest day</option></select></div>${day.rest ? `<p class="helper">Recovery is part of the plan. Change to Workout if needed.</p>` : `<details><summary>${safe(day.headline || 'Edit workout')} · Edit details and blocks</summary><div class="week-day-details"><div class="form-group"><label for="week-headline-${day.day_of_week}">Workout title</label><input id="week-headline-${day.day_of_week}" data-week-field="headline" maxlength="60" value="${safe(day.headline)}"></div><div class="form-group"><label for="week-description-${day.day_of_week}">Athlete instructions</label><textarea id="week-description-${day.day_of_week}" data-week-field="description" rows="3">${safe(day.description)}</textarea></div><div class="form-group"><label for="week-why-${day.day_of_week}">Why this session</label><textarea id="week-why-${day.day_of_week}" data-week-field="why_line" rows="2">${safe(day.why_line)}</textarea></div><div class="block-list">${weekBlocksMarkup(day)}</div><button type="button" class="secondary small-button" data-week-add="${day.day_of_week}">Add block</button></div></details>`}</article>`;
+}
+function captureWeekEditor() {
+  const draft = state.weekDraft; if (!draft) return;
+  draft.focus = $('#week-focus')?.value ?? draft.focus;
+  for (const row of document.querySelectorAll('[data-week-day]')) {
+    const day = draft.days.find((d) => d.day_of_week === Number(row.dataset.weekDay)); if (!day) continue;
+    day.rest = row.querySelector('[data-week-field="mode"]').value === 'rest';
+    if (day.rest) continue;
+    for (const field of ['headline', 'description', 'why_line']) {
+      const input = row.querySelector(`[data-week-field="${field}"]`); if (input) day[field] = input.value;
+    }
+    const blocks = [...row.querySelectorAll('[data-week-block]')].map((block) => ({
+      type: block.querySelector('[data-week-block-field="type"]').value,
+      zone: block.querySelector('[data-week-block-field="zone"]').value,
+      duration_min: Number(block.querySelector('[data-week-block-field="duration_min"]').value),
+    }));
+    day.blocks = blocks.length ? blocks : day.blocks?.length ? day.blocks : [{ type: 'work', zone: 'endurance', duration_min: 45 }];
+  }
+}
+function updateWeekTotal() {
+  if (!state.weekDraft) return;
+  const total = state.weekDraft.days.reduce((n, d) => n + weekMinutes(d), 0);
+  const limit = Math.round(state.weekDraft.evidence.baseline_cap_min * 1.2);
+  $('#week-total').textContent = trainingMinutesLabel(total);
+  $('#week-load-warning').hidden = total <= limit;
+}
+function renderWeekEditor() {
+  const d = state.weekDraft;
+  const selected = d?.week_start_date || state.weekSelection || currentWeek();
+  const selector = `<div class="form-group"><label for="week-start">Planning week</label><select id="week-start"><option value="${currentWeek()}" ${selected === currentWeek() ? 'selected' : ''}>This week · ${safe(dateLabel(currentWeek()))}</option><option value="${nextWeek()}" ${selected === nextWeek() ? 'selected' : ''}>Next week · ${safe(dateLabel(nextWeek()))}</option></select></div>`;
+  const focus = `<div class="form-group"><label for="week-focus">Coach focus, optional</label><textarea id="week-focus" rows="2" maxlength="500" placeholder="Build aerobic base, with one sprint session">${safe(d?.focus || '')}</textarea><p class="helper">A short direction for the assistant. You can change every draft day before publishing.</p></div>`;
+  const content = d ? `<div class="callout"><strong>Conservative baseline</strong><p>${safe(d.summary || 'A balanced starting point for coach review.')}</p><small>Recent cycling average: ${safe(trainingMinutesLabel(d.evidence.recent_average_min))} per week · Draft ceiling: ${safe(trainingMinutesLabel(d.evidence.baseline_cap_min))} · Single-session evidence limit: ${safe(trainingMinutesLabel(d.evidence.session_cap_min))}. ${d.notes_considered ? `${d.notes_considered} athlete note${d.notes_considered === 1 ? '' : 's'} considered.` : 'No athlete notes yet.'}${d.evidence.sessions < 2 ? ' Recent riding is limited, so review the starting load closely.' : ''}</small></div><div class="week-edit-list">${d.days.map(weekDayMarkup).join('')}</div><div class="week-review"><div><span>Reviewed week</span><strong id="week-total"></strong></div><p>AI prepared the baseline. You decide whether to publish it; fixed days stay in place.</p><div id="week-load-warning" class="callout warning" hidden><label class="acknowledge"><input id="week-acknowledge" type="checkbox"> I reviewed the added load above the conservative baseline.</label></div><p id="week-error" class="form-error" role="alert"></p><button type="button" class="primary" data-publish-week>Publish reviewed week</button><button type="button" class="quiet" data-generate-week>Generate a new baseline</button></div>` : `<div class="list-empty"><strong>Start with a safe baseline</strong><p>The assistant drafts the whole week from recent training, recovery, goals and athlete notes. Completed work and races stay fixed.</p><button type="button" class="primary" data-generate-week>Generate baseline week</button></div>`;
+  openEditor('week', 'WEEK BUILDER', 'Build the full week', `<p>Build a conservative starting week, then make the coaching decisions together.</p>${selector}${focus}<p id="week-status" class="status" role="status"></p>${content}`);
+  if (d) updateWeekTotal();
+}
+function openWeek() { state.weekDraft = null; state.weekSelection = currentWeek(); state.editorDirty = false; renderWeekEditor(); }
+function rerenderWeek() {
+  const y = window.scrollY;
+  const openDays = [...document.querySelectorAll('[data-week-day] details[open]')]
+    .map((details) => details.closest('[data-week-day]').dataset.weekDay);
+  renderWeekEditor();
+  for (const day of openDays) { const details = document.querySelector(`[data-week-day="${day}"] details`); if (details) details.open = true; }
+  window.scrollTo(0, y);
+}
+async function generateWeek() {
+  if (state.weekGenerating) return;
+  const week_start_date = $('#week-start').value; const focus = $('#week-focus').value.trim();
+  state.weekGenerating = true;
+  const button = $('[data-generate-week]'); if (button) button.disabled = true;
+  $('#week-status').textContent = 'Building a conservative week…';
+  try {
+    const result = await portal('draft_week', { athlete_id: state.athleteId, week_start_date,
+      client_date: localDate(), focus });
+    state.weekSelection = week_start_date; state.weekDraft = { ...result, focus }; state.editorDirty = true;
+    renderWeekEditor(); $('#week-status').textContent = 'Baseline ready. Review each day before publishing.';
+  } catch (error) { setStatus(error.message, true, '#week-status'); }
+  finally { state.weekGenerating = false; if (button?.isConnected) button.disabled = false; }
+}
+async function publishWeek() {
+  if (state.weekPublishing) return;
+  captureWeekEditor(); const draft = state.weekDraft; if (!draft) return;
+  const editable = draft.days.filter((d) => !d.locked);
+  const invalid = editable.find((d) => !d.rest && (!d.headline?.trim() || !d.blocks?.length
+    || d.blocks.some((b) => !Number.isInteger(b.duration_min) || b.duration_min < 1 || b.duration_min > 180)));
+  if (invalid) {
+    $('#week-error').textContent = `Review the title and blocks for ${DAYS[invalid.day_of_week]}.`;
+    const row = document.querySelector(`[data-week-day="${invalid.day_of_week}"]`);
+    const details = row?.querySelector('details'); if (details) details.open = true;
+    const field = !invalid.headline?.trim() ? row?.querySelector('[data-week-field="headline"]')
+      : [...(row?.querySelectorAll('[data-week-block-field="duration_min"]') || [])]
+        .find((input) => !Number.isInteger(Number(input.value)) || Number(input.value) < 1 || Number(input.value) > 180);
+    field?.setAttribute('aria-invalid', 'true'); field?.focus(); return;
+  }
+  const total = draft.days.reduce((n, d) => n + weekMinutes(d), 0);
+  const acknowledge_load = total <= draft.evidence.baseline_cap_min * 1.2 || $('#week-acknowledge')?.checked === true;
+  if (!acknowledge_load) { $('#week-error').textContent = 'Review the added load and tick the confirmation before publishing.'; $('#week-acknowledge').focus(); return; }
+  state.weekPublishing = true;
+  const button = $('[data-publish-week]'); if (button) button.disabled = true;
+  $('#week-error').textContent = 'Publishing the reviewed week…';
+  try {
+    const result = await portal('publish_week', { athlete_id: state.athleteId,
+      week_start_date: draft.week_start_date, client_date: localDate(),
+      days: editable, confirmed: true, acknowledge_load });
+    closeDrawer(true); await selectAthlete(state.athleteId);
+    setStatus(result.safety_adjusted ? 'Week published. Trainable shortened a session to the athlete’s safety limit; review its duration.' : 'Reviewed week published to the athlete’s plan.');
+  } catch (error) { $('#week-error').textContent = error.message; }
+  finally { state.weekPublishing = false; if (button?.isConnected) button.disabled = false; }
+}
+function openNote() {
+  state.editorDirty = false;
+  openEditor('note', 'ATHLETE CONTEXT', 'Add an athlete note', `<p>Record something useful for planning. The athlete and their connected coach can see this note. The assistant may use it when relevant, with the athlete’s AI sharing permission.</p><div class="form-group"><label for="note-kind">Note type</label><select id="note-kind"><option value="observation">Training response</option><option value="preference">Preference</option><option value="goal">Goal</option><option value="constraint">Constraint</option></select></div><div class="form-group"><label for="note-body">What should the coach remember?</label><textarea id="note-body" rows="5" maxlength="500" placeholder="Sprints late in a long Z2 ride tend to feel flat; try them earlier."></textarea><p class="helper">Describe an observation, not a diagnosis. You can archive it when it stops being useful.</p></div><p id="note-error" class="form-error" role="alert"></p><button type="button" class="primary" data-save-note>Save athlete note</button>`);
+  $('#note-body').focus();
+}
+async function saveNote() {
+  if (state.noteSaving) return;
+  const body = $('#note-body').value.trim();
+  if (body.length < 3) { $('#note-error').textContent = 'Add a few words about this athlete.';
+    $('#note-body').setAttribute('aria-invalid', 'true'); $('#note-body').focus(); return; }
+  state.noteSaving = true;
+  const button = $('[data-save-note]'); if (button) button.disabled = true;
+  $('#note-error').textContent = 'Saving note…';
+  try {
+    await portal('add_note', { athlete_id: state.athleteId, kind: $('#note-kind').value, body });
+    closeDrawer(true); await selectAthlete(state.athleteId); setStatus('Athlete note saved.');
+  } catch (error) { $('#note-error').textContent = error.message; }
+  finally { state.noteSaving = false; if (button?.isConnected) button.disabled = false; }
+}
+async function archiveNote() {
+  const noteId = state.noteToArchive; state.noteToArchive = null;
+  if (!noteId) return;
+  try {
+    await portal('archive_note', { athlete_id: state.athleteId, note_id: noteId });
+    await selectAthlete(state.athleteId); setStatus('Athlete note archived.');
   } catch (error) { setStatus(error.message, true); }
 }
 function meetingMarkup() {
@@ -310,7 +443,11 @@ $('#athlete-pane').addEventListener('click', (event) => {
   const action = event.target.closest('[data-action]')?.dataset.action;
   if (action === 'new-workout') openBuilder();
   if (action === 'new-meeting') openMeeting();
+  if (action === 'new-note') openNote();
+  if (action === 'build-week') openWeek();
   if (action === 'review-week') reviewWeek();
+  const noteId = event.target.closest('[data-archive-note]')?.dataset.archiveNote;
+  if (noteId) { state.noteToArchive = noteId; $('#archive-note-dialog').showModal(); $('#keep-note').focus(); }
   const change = event.target.closest('[data-change]')?.dataset.change;
   if (change) { const [mi, ci] = change.split(':').map(Number); openBuilder(state.athlete.meetings[mi]?.proposed_changes[ci] || ''); }
 });
@@ -319,6 +456,7 @@ $('#join-team').addEventListener('click', joinPanel);
 $('#close-drawer').addEventListener('click', () => closeDrawer());
 $('#drawer-backdrop').addEventListener('click', () => closeDrawer());
 $('#discard-dialog').addEventListener('close', () => { if ($('#discard-dialog').returnValue === 'confirm') closeDrawer(true); else $('#close-drawer').focus(); });
+$('#archive-note-dialog').addEventListener('close', () => { if ($('#archive-note-dialog').returnValue === 'confirm') archiveNote(); else state.noteToArchive = null; });
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !$('#drawer').hidden && !$('#revoke-dialog').open && !$('#discard-dialog').open) closeDrawer();
   if (event.key === 'Tab' && !$('#drawer').hidden && !$('#drawer').classList.contains('page-mode')) {
@@ -341,6 +479,24 @@ $('#drawer-body').addEventListener('click', async (event) => {
   }
   if (el.hasAttribute('data-analyze-minutes')) analyzeMinutes();
   if (el.hasAttribute('data-save-minutes')) saveMinutes();
+  if (el.hasAttribute('data-save-note')) saveNote();
+  if (el.hasAttribute('data-generate-week')) generateWeek();
+  if (el.hasAttribute('data-publish-week')) publishWeek();
+  if (el.hasAttribute('data-week-add')) {
+    captureWeekEditor(); const day = state.weekDraft.days.find((d) => d.day_of_week === Number(el.dataset.weekAdd));
+    if (day) { day.blocks.push({ type: 'work', zone: 'endurance', duration_min: 10 }); state.editorDirty = true; rerenderWeek(); }
+  }
+  if (el.hasAttribute('data-week-remove')) {
+    captureWeekEditor(); const [dayNo, index] = el.dataset.weekRemove.split(':').map(Number);
+    const day = state.weekDraft.days.find((d) => d.day_of_week === dayNo);
+    if (day && day.blocks.length > 1) { day.blocks.splice(index, 1); state.editorDirty = true; rerenderWeek(); }
+    else $('#week-error').textContent = 'Keep at least one block or choose Rest day.';
+  }
+  if (el.hasAttribute('data-week-move')) {
+    captureWeekEditor(); const [dayNo, from, offset] = el.dataset.weekMove.split(':').map(Number);
+    const day = state.weekDraft.days.find((d) => d.day_of_week === dayNo); const to = from + offset;
+    if (day && to >= 0 && to < day.blocks.length) { const [item] = day.blocks.splice(from, 1); day.blocks.splice(to, 0, item); state.editorDirty = true; rerenderWeek(); }
+  }
   if (el.hasAttribute('data-create-invite')) createInvite();
   if (el.hasAttribute('data-copy-code')) {
     try { await navigator.clipboard.writeText($('#invite-result').dataset.code); el.textContent = 'Copied'; }
@@ -360,21 +516,61 @@ $('#drawer-body').addEventListener('click', async (event) => {
   }
 });
 let dragged = null;
-$('#drawer-body').addEventListener('dragstart', (event) => { const row = event.target.closest('.block-row'); if (!row) return; dragged = Number(row.dataset.block); row.classList.add('dragging'); });
-$('#drawer-body').addEventListener('dragover', (event) => { const row = event.target.closest('.block-row'); if (!row || dragged === null) return; event.preventDefault(); row.classList.add('drag-target'); });
+$('#drawer-body').addEventListener('dragstart', (event) => { const row = event.target.closest('[data-block]'); if (!row || !state.builder) return; dragged = Number(row.dataset.block); row.classList.add('dragging'); });
+$('#drawer-body').addEventListener('dragover', (event) => { const row = event.target.closest('[data-block]'); if (!row || dragged === null) return; event.preventDefault(); row.classList.add('drag-target'); });
 $('#drawer-body').addEventListener('dragleave', (event) => { event.target.closest('.block-row')?.classList.remove('drag-target'); });
 $('#drawer-body').addEventListener('drop', (event) => {
-  const row = event.target.closest('.block-row'); if (!row || dragged === null) return; event.preventDefault();
+  const row = event.target.closest('[data-block]'); if (!row || dragged === null) return; event.preventDefault();
   const to = Number(row.dataset.block); captureBuilder(); state.editorDirty = true; const [item] = state.builder.blocks.splice(dragged, 1); state.builder.blocks.splice(to, 0, item); dragged = null; renderBuilder();
 });
 $('#drawer-body').addEventListener('dragend', () => { dragged = null; document.querySelectorAll('.block-row').forEach((row) => row.classList.remove('dragging', 'drag-target')); });
 $('#drawer-body').addEventListener('input', (event) => {
   if ($('#drawer').classList.contains('page-mode')) state.editorDirty = true;
+  if (event.target.id === 'note-body' || event.target.matches('[data-week-block-field="duration_min"], [data-week-field="headline"]'))
+    event.target.removeAttribute('aria-invalid');
+  if (event.target.closest('[data-week-day]')) { captureWeekEditor(); updateWeekTotal(); }
   if (event.target.matches('[data-block-field="duration_min"]')) {
     const total = [...document.querySelectorAll('[data-block-field="duration_min"]')].reduce((sum, input) => sum + Number(input.value || 0), 0);
     $('#builder-duration').textContent = minutesLabel(total);
   }
-  if (event.target.closest('#drawer-body')) { const err = $('#builder-error') || $('#meeting-error'); if (err) err.textContent = ''; }
+  if (event.target.closest('#drawer-body')) { const err = $('#builder-error') || $('#meeting-error') || $('#week-error') || $('#note-error'); if (err) err.textContent = ''; }
+});
+$('#drawer-body').addEventListener('focusout', (event) => {
+  if (event.target.id === 'note-body' && event.target.value.trim().length > 0 && event.target.value.trim().length < 3) {
+    event.target.setAttribute('aria-invalid', 'true');
+    $('#note-error').textContent = 'Add a few words about this athlete.';
+  }
+  if (event.target.matches('[data-week-field="headline"]') && !event.target.value.trim()) {
+    event.target.setAttribute('aria-invalid', 'true');
+    $('#week-error').textContent = `Add a title for ${DAYS[Number(event.target.closest('[data-week-day]').dataset.weekDay)]}.`;
+  }
+  if (event.target.matches('[data-week-block-field="duration_min"]')) {
+    const minutes = Number(event.target.value);
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 180) {
+      event.target.setAttribute('aria-invalid', 'true');
+      $('#week-error').textContent = 'Each workout block needs 1–180 minutes.';
+    }
+  }
+});
+$('#drawer-body').addEventListener('change', (event) => {
+  if (event.target.id === 'note-kind') state.editorDirty = true;
+  if (event.target.id === 'week-start') {
+    const wanted = event.target.value;
+    if (state.weekDraft && wanted !== state.weekDraft.week_start_date && !window.confirm('Discard this week draft and switch weeks?')) {
+      event.target.value = state.weekDraft.week_start_date; return;
+    }
+    state.weekSelection = wanted; state.weekDraft = null; state.editorDirty = false; renderWeekEditor(); return;
+  }
+  if (event.target.matches('[data-week-field="mode"]')) {
+    const row = event.target.closest('[data-week-day]');
+    const day = state.weekDraft?.days.find((d) => d.day_of_week === Number(row?.dataset.weekDay));
+    captureWeekEditor();
+    if (day && !day.rest && day.workout_type === 'rest') Object.assign(day, { headline: 'Easy endurance',
+      description: 'Ride steadily in Z2.', why_line: 'A controlled endurance session.',
+      workout_type: 'endurance', intent: 'aerobic_base',
+      blocks: [{ type: 'work', zone: 'endurance', duration_min: 45 }] });
+    state.editorDirty = true; rerenderWeek();
+  }
 });
 async function start() {
   if (await handleOAuth()) return;
